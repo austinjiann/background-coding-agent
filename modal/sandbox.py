@@ -5,8 +5,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
+from base64 import b64encode
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import modal
@@ -20,13 +25,14 @@ opencode_image = (
         "apt-get install -y nodejs",
         "npm install -g opencode-ai",
     )
-    .pip_install("anthropic", "playwright")
+    .pip_install("anthropic", "boto3", "playwright")
     .run_commands("playwright install --with-deps chromium")
 )
 
 WORKSPACE_ROOT = Path("/workspace")
 REPO_PATH = WORKSPACE_ROOT / "repo"
 ARTIFACT_DIR_NAME = ".phoebe_artifacts"
+SCREENSHOT_DIR_NAME = ".phoebe_screenshots"
 
 
 def _log_step(step: str) -> None:
@@ -125,6 +131,136 @@ def _get_artifact_paths() -> tuple[Path, Path, Path]:
         artifact_root / "summary.md",
         artifact_root / "test-results.json",
     )
+
+
+def _get_screenshot_root() -> Path:
+    return REPO_PATH / SCREENSHOT_DIR_NAME
+
+
+def _parse_json_object(raw_value: str) -> dict[str, object]:
+    if not raw_value.strip():
+        return {}
+    parsed = json.loads(raw_value)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _start_background_process(command: str, cwd: Path, env: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["bash", "-lc", command],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def _stop_background_process(process: subprocess.Popen[str] | None) -> str:
+    if process is None:
+        return ""
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout_text, stderr_text = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout_text, stderr_text = process.communicate(timeout=5)
+    else:
+        stdout_text, stderr_text = process.communicate()
+    stdout_text = stdout_text.strip()
+    stderr_text = stderr_text.strip()
+    return "\n".join(part for part in [stdout_text, stderr_text] if part).strip()
+
+
+def _wait_for_url(url: str, timeout_seconds: int = 60) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=5) as response:
+                if response.status < 500:
+                    return
+        except (URLError, TimeoutError, OSError):
+            time.sleep(2)
+    raise RuntimeError(f"Timed out waiting for {url}")
+
+
+def _ensure_visual_env(env_values: dict[str, object], required_names: list[str]) -> dict[str, str]:
+    collected: dict[str, str] = {}
+    missing: list[str] = []
+    for name in required_names:
+        raw_value = env_values.get(name)
+        if isinstance(raw_value, str) and raw_value.strip():
+            collected[name] = raw_value
+        else:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(f"Missing visual env vars: {', '.join(sorted(missing))}")
+    return collected
+
+
+def _service_enabled(config: dict[str, object]) -> bool:
+    enabled = config.get("enabled")
+    if isinstance(enabled, bool):
+        return enabled
+    return True
+
+
+def _install_frontend_dependencies(frontend_dir: Path) -> None:
+    lock_path = frontend_dir / "package-lock.json"
+    install_command = ["npm", "ci"] if lock_path.exists() else ["npm", "install"]
+    _log_step("frontend.install.started")
+    print(f"Phoebe installing frontend dependencies with: {_format_command(install_command)}", flush=True)
+    result, _, _, stderr_text = _run_command(install_command, cwd=frontend_dir, timeout=300)
+    if result["status"] != "passed":
+        raise RuntimeError(stderr_text or "Failed to install frontend dependencies")
+    _log_step("frontend.install.completed")
+
+
+def _upload_png_to_r2(file_path: Path, filename: str, r2_env: dict[str, object]) -> str:
+    import boto3
+    from botocore.config import Config
+
+    required_names = [
+        "R2_ACCOUNT_ID",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_BUCKET_NAME",
+        "R2_PUBLIC_URL",
+    ]
+    missing = [name for name in required_names if not isinstance(r2_env.get(name), str) or not str(r2_env.get(name)).strip()]
+    if missing:
+        raise RuntimeError(f"Missing R2 env vars: {', '.join(sorted(missing))}")
+
+    account_id = str(r2_env["R2_ACCOUNT_ID"])
+    access_key = str(r2_env["R2_ACCESS_KEY_ID"])
+    secret_key = str(r2_env["R2_SECRET_ACCESS_KEY"])
+    bucket_name = str(r2_env["R2_BUCKET_NAME"])
+    public_url = str(r2_env["R2_PUBLIC_URL"]).rstrip("/")
+    key = f"screenshots/{int(time.time())}-{filename}"
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+    client.upload_file(
+        str(file_path),
+        bucket_name,
+        key,
+        ExtraArgs={"ContentType": "image/png"},
+    )
+    print(f"Phoebe uploaded screenshot to R2: {key}", flush=True)
+    return f"{public_url}/{key}"
 
 
 def _extract_text_fragments(value: object) -> list[str]:
@@ -489,6 +625,151 @@ def run_opencode_job(
     }
 
 
+def run_visual_verification_job(
+    *,
+    ticket_id: str,
+    run_id: str,
+    ticket_title: str,
+    ticket_description: str,
+    repo_url: str,
+    default_branch: str,
+    branch_name: str,
+    pr_url: str,
+    github_token: str,
+    visual_config_json: str,
+    visual_env_json: str,
+    r2_env_json: str,
+) -> dict[str, object]:
+    from playwright.sync_api import sync_playwright
+
+    visual_config = _parse_json_object(visual_config_json)
+    visual_env = _parse_json_object(visual_env_json)
+    r2_env = _parse_json_object(r2_env_json)
+    routes = visual_config.get("routes")
+    if not isinstance(routes, list) or not routes:
+        _log_step("screenshots.skipped")
+        return {
+            "ok": True,
+            "skipped": True,
+            "summary": "No visual routes were configured for screenshot capture.",
+            "screenshots": [],
+            "error": None,
+        }
+
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    if REPO_PATH.exists():
+        shutil.rmtree(REPO_PATH)
+
+    _log_step("repo.clone.started")
+    clone_result, _, _, clone_stderr = _run_command(["git", "clone", _build_clone_url(repo_url, github_token), str(REPO_PATH)])
+    if clone_result["status"] != "passed":
+        return {
+            "ok": False,
+            "skipped": False,
+            "summary": f"Failed to clone {repo_url} for visual verification.",
+            "screenshots": [],
+            "error": clone_stderr or "git clone failed during visual verification",
+        }
+    _log_step("repo.clone.completed")
+
+    after_frontend_process = None
+    screenshot_root = _get_screenshot_root()
+    if screenshot_root.exists():
+        shutil.rmtree(screenshot_root)
+    screenshot_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        frontend_config = visual_config.get("frontend")
+        if not isinstance(frontend_config, dict):
+            raise RuntimeError("Invalid visual config: frontend settings are required")
+
+        frontend_env = _ensure_visual_env(
+            visual_env,
+            [name for name in frontend_config.get("envVarNames", []) if isinstance(name, str)],
+        )
+
+        after_branch_command = ["git", "checkout", branch_name]
+        after_checkout, _, _, after_stderr = _run_command(after_branch_command, cwd=REPO_PATH)
+        if after_checkout["status"] != "passed":
+            raise RuntimeError(after_stderr or f"Failed to checkout {branch_name}")
+        print(f"Phoebe checked out change branch: {branch_name}", flush=True)
+
+        base_env = {
+            **dict(os.environ),
+            "CI": "1",
+        }
+        frontend_process_env = {**base_env, **frontend_env}
+        _install_frontend_dependencies(REPO_PATH / str(frontend_config.get("workingDirectory", "")))
+
+        _log_step("screenshots.started")
+        after_frontend_process = _start_background_process(
+            str(frontend_config.get("startCommand", "")),
+            REPO_PATH / str(frontend_config.get("workingDirectory", "")),
+            frontend_process_env,
+        )
+        print(f"Phoebe waiting for frontend: {frontend_config.get('url', '')}", flush=True)
+        _wait_for_url(str(frontend_config.get("url", "")))
+        _log_step("frontend.ready")
+
+        screenshots: list[dict[str, object]] = []
+        frontend_url = str(frontend_config.get("url", "")).rstrip("/")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            for route in routes:
+                if not isinstance(route, dict):
+                    continue
+                label = str(route.get("label", "Page"))
+                route_path = str(route.get("path", "/"))
+                after_filename = f"after-{label.lower().replace(' ', '-')}.png"
+                after_path = screenshot_root / after_filename
+                print(f"Phoebe capturing after screenshot for {label} at {route_path}", flush=True)
+                page.goto(f"{frontend_url}{route_path}", wait_until="domcontentloaded")
+                page.screenshot(path=str(after_path), full_page=True)
+                _log_step("screenshot.after.captured")
+                screenshots.append(
+                    {
+                        "filename": after_filename,
+                        "label": label,
+                        "kind": "after",
+                        "path": route_path,
+                        "contentBase64": b64encode(after_path.read_bytes()).decode("utf-8"),
+                        "url": _upload_png_to_r2(after_path, after_filename, r2_env),
+                    }
+                )
+                _log_step("screenshot.after.uploaded")
+            browser.close()
+
+        after_frontend_logs = _stop_background_process(after_frontend_process)
+        after_frontend_process = None
+        _log_step("screenshots.completed")
+        return {
+            "ok": True,
+            "skipped": False,
+            "summary": f"Captured screenshots for {ticket_id} and updated PR evidence for {pr_url}.",
+            "screenshots": screenshots,
+            "error": None,
+            "logs": "\n\n".join(
+                part
+                for part in [
+                    after_frontend_logs,
+                ]
+                if part
+            ),
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "skipped": False,
+            "summary": f"Visual verification failed for {ticket_id}.",
+            "screenshots": [],
+            "error": str(error),
+        }
+    finally:
+        _stop_background_process(after_frontend_process)
+
+
 @app.function(image=opencode_image, timeout=900, cpu=2.0, memory=2048)
 def run_opencode(
     ticket_id: str,
@@ -515,5 +796,39 @@ def run_opencode(
         triage_model_id=triage_model_id,
         simple_model_id=simple_model_id,
         complex_model_id=complex_model_id,
+    )
+    return json.dumps(result)
+
+
+@app.function(image=opencode_image, timeout=900, cpu=2.0, memory=2048)
+def run_visual_verification(
+    ticket_id: str,
+    run_id: str,
+    ticket_title: str,
+    ticket_description: str,
+    repo_url: str,
+    default_branch: str,
+    branch_name: str,
+    pr_url: str,
+    github_token: str = "",
+    anthropic_api_key: str = "",
+    visual_config_json: str = "{}",
+    visual_env_json: str = "{}",
+    r2_env_json: str = "{}",
+) -> str:
+    del anthropic_api_key
+    result = run_visual_verification_job(
+        ticket_id=ticket_id,
+        run_id=run_id,
+        ticket_title=ticket_title,
+        ticket_description=ticket_description,
+        repo_url=repo_url,
+        default_branch=default_branch,
+        branch_name=branch_name,
+        pr_url=pr_url,
+        github_token=github_token,
+        visual_config_json=visual_config_json,
+        visual_env_json=visual_env_json,
+        r2_env_json=r2_env_json,
     )
     return json.dumps(result)

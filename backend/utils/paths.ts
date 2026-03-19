@@ -67,6 +67,10 @@ export function getScreenshotsPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), "screenshots");
 }
 
+export function getScreenshotsMetadataPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "screenshots.json");
+}
+
 export async function findRunPathByRunId(runId: string): Promise<RunLocation | null> {
   const runsRoot = getRunsRoot();
   const ticketDirs = await readdir(runsRoot, { withFileTypes: true }).catch(() => []);

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +14,8 @@ import {
   getModalOutputPath,
   getOpenCodeOutputPath,
   getRunPath,
+  getScreenshotsMetadataPath,
+  getScreenshotsPath,
   getSummaryPath,
   getTestOutputPath,
   getTestResultsPath,
@@ -68,8 +70,31 @@ type ModalAgentResult = {
 };
 
 type ModalRunOutput = {
-  result: ModalAgentResult | null;
+  result: unknown;
   cliOutput: string;
+};
+
+type ScreenshotArtifact = {
+  filename: string;
+  label: string;
+  kind: "before" | "after";
+  path: string;
+  url: string;
+  contentBase64: string;
+};
+
+type VisualVerificationResult = {
+  ok: boolean;
+  skipped: boolean;
+  summary: string;
+  screenshots: ScreenshotArtifact[];
+  error?: string | null;
+};
+
+type ModalFunctionInvocation = {
+  entrypoint: string;
+  args: string[];
+  resultKey?: string;
 };
 
 const activeModalProcesses = new Map<string, ChildProcessWithoutNullStreams>();
@@ -111,6 +136,18 @@ const LOG_MARKER_EVENTS: Record<string, { type: string; message: string }> = {
     type: "branch.published",
     message: "Branch publication completed",
   },
+  "screenshots.started": {
+    type: "screenshots.started",
+    message: "Visual verification started",
+  },
+  "screenshots.completed": {
+    type: "screenshots.completed",
+    message: "Visual verification completed",
+  },
+  "screenshots.skipped": {
+    type: "screenshots.skipped",
+    message: "Visual verification skipped",
+  },
 };
 
 async function isCanceled(runId: string) {
@@ -127,6 +164,53 @@ function buildPythonPath() {
 
 function getModalResultPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), ".modal-result.json");
+}
+
+function getModalFunctionResultPath(ticketId: string, runId: string, resultKey = "result") {
+  return path.join(getRunPath(ticketId, runId), `.modal-${resultKey}.json`);
+}
+
+function globToRegExp(glob: string) {
+  const regexSource = glob
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "§§DOUBLE_STAR§§")
+    .replace(/\*/g, "[^/]*")
+    .replace(/§§DOUBLE_STAR§§/g, ".*");
+  return new RegExp(`^${regexSource}$`);
+}
+
+function matchesVisualGlobs(paths: string[]) {
+  if (!TEST_REPO_CONFIG.visual.enabled) {
+    return false;
+  }
+
+  const globs = TEST_REPO_CONFIG.visual.uiGlobs.map(globToRegExp);
+  return paths.some((filePath) => globs.some((glob) => glob.test(filePath)));
+}
+
+function collectEnvValues(envVarNames: string[]) {
+  return Object.fromEntries(
+    envVarNames
+      .map((name) => [name, process.env[name]?.trim() ?? ""])
+      .filter(([, value]) => value),
+  );
+}
+
+function collectVisualRuntimeConfig() {
+  return {
+    frontend: TEST_REPO_CONFIG.visual.frontend,
+    routes: TEST_REPO_CONFIG.visual.routes,
+  };
+}
+
+function collectR2EnvValues() {
+  return collectEnvValues([
+    "R2_ACCOUNT_ID",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_BUCKET_NAME",
+    "R2_PUBLIC_URL",
+  ]);
 }
 
 async function writeFailureArtifacts(ticketId: string, runId: string, message: string) {
@@ -175,6 +259,83 @@ async function writeSuccessArtifacts(ticketId: string, runId: string, result: Mo
   ]);
 }
 
+async function writeScreenshotArtifacts(
+  ticketId: string,
+  runId: string,
+  screenshots: ScreenshotArtifact[],
+) {
+  const screenshotsPath = getScreenshotsPath(ticketId, runId);
+  await mkdir(screenshotsPath, { recursive: true });
+
+  await Promise.all(
+    screenshots.map((screenshot) =>
+      writeFile(
+        path.join(screenshotsPath, screenshot.filename),
+        Buffer.from(screenshot.contentBase64, "base64"),
+      ),
+    ),
+  );
+
+  await writeFile(
+    getScreenshotsMetadataPath(ticketId, runId),
+    JSON.stringify(
+      {
+        screenshots: screenshots.map(({ contentBase64, ...metadata }) => metadata),
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+}
+
+function shouldRunScreenshots(changedFiles: ChangedFile[]) {
+  return matchesVisualGlobs(changedFiles.map((file) => file.path));
+}
+
+async function runVisualVerification(
+  input: LaunchSandboxInput,
+  branchName: string,
+): Promise<VisualVerificationResult | null> {
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
+  const githubToken = process.env.GITHUB_TOKEN ?? "";
+  const visualEnv = collectEnvValues(TEST_REPO_CONFIG.visual.frontend.envVarNames);
+  const r2Env = collectR2EnvValues();
+
+  return runModalFunction<VisualVerificationResult>(input, {
+    entrypoint: "run_visual_verification",
+    resultKey: "screenshots",
+    args: [
+      "--ticket-id",
+      input.ticketId,
+      "--run-id",
+      input.runId,
+      "--ticket-title",
+      input.ticketTitle,
+      "--ticket-description",
+      input.ticketDescription,
+      "--repo-url",
+      TEST_REPO_CONFIG.repoUrl.trim(),
+      "--default-branch",
+      TEST_REPO_CONFIG.defaultBranch,
+      "--branch-name",
+      branchName,
+      "--pr-url",
+      "",
+      "--github-token",
+      githubToken,
+      "--anthropic-api-key",
+      anthropicApiKey,
+      "--visual-config-json",
+      JSON.stringify(collectVisualRuntimeConfig()),
+      "--visual-env-json",
+      JSON.stringify(visualEnv),
+      "--r2-env-json",
+      JSON.stringify(r2Env),
+    ],
+  }).then(({ result }) => result);
+}
+
 async function appendModalLogChunk(ticketId: string, runId: string, chunk: string) {
   if (!chunk) {
     return;
@@ -214,7 +375,10 @@ async function appendEventsForMarkers(runId: string, chunk: string, seenMarkers:
   }
 }
 
-async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutput> {
+async function runModalFunction<T>(input: LaunchSandboxInput, invocation: ModalFunctionInvocation): Promise<{
+  result: T | null;
+  cliOutput: string;
+}> {
   const repoUrl = TEST_REPO_CONFIG.repoUrl.trim();
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
 
@@ -226,39 +390,14 @@ async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutpu
     throw new Error("ANTHROPIC_API_KEY is not configured");
   }
 
-  const resultPath = getModalResultPath(input.ticketId, input.runId);
+  const resultPath = getModalFunctionResultPath(input.ticketId, input.runId, invocation.resultKey);
   const modalBinary = process.env.MODAL_BIN ?? "modal";
-  const githubToken = process.env.GITHUB_TOKEN ?? "";
-  const triageModelId = process.env.TRIAGE_MODEL_ID ?? DEFAULT_TRIAGE_MODEL_ID;
-  const simpleModelId = process.env.SIMPLE_MODEL_ID ?? DEFAULT_SIMPLE_MODEL_ID;
-  const complexModelId = process.env.COMPLEX_MODEL_ID ?? DEFAULT_COMPLEX_MODEL_ID;
   const modalArgs = [
     "run",
     "--write-result",
     resultPath,
-    `${modalEntrypointPath}::run_opencode`,
-    "--ticket-id",
-    input.ticketId,
-    "--run-id",
-    input.runId,
-    "--ticket-title",
-    input.ticketTitle,
-    "--ticket-description",
-    input.ticketDescription,
-    "--repo-url",
-    repoUrl,
-    "--default-branch",
-    TEST_REPO_CONFIG.defaultBranch,
-    "--github-token",
-    githubToken,
-    "--anthropic-api-key",
-    anthropicApiKey,
-    "--triage-model-id",
-    triageModelId,
-    "--simple-model-id",
-    simpleModelId,
-    "--complex-model-id",
-    complexModelId,
+    `${modalEntrypointPath}::${invocation.entrypoint}`,
+    ...invocation.args,
   ];
   const child = spawn(modalBinary, modalArgs, {
     cwd: repoRoot,
@@ -321,9 +460,46 @@ async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutpu
   }
 
   return {
-    result: JSON.parse(resultRaw) as ModalAgentResult,
+    result: JSON.parse(resultRaw) as T,
     cliOutput,
   };
+}
+
+async function runModalCommand(input: LaunchSandboxInput): Promise<{ result: ModalAgentResult | null; cliOutput: string }> {
+  const githubToken = process.env.GITHUB_TOKEN ?? "";
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
+  const triageModelId = process.env.TRIAGE_MODEL_ID ?? DEFAULT_TRIAGE_MODEL_ID;
+  const simpleModelId = process.env.SIMPLE_MODEL_ID ?? DEFAULT_SIMPLE_MODEL_ID;
+  const complexModelId = process.env.COMPLEX_MODEL_ID ?? DEFAULT_COMPLEX_MODEL_ID;
+
+  return runModalFunction<ModalAgentResult>(input, {
+    entrypoint: "run_opencode",
+    resultKey: "opencode",
+    args: [
+      "--ticket-id",
+      input.ticketId,
+      "--run-id",
+      input.runId,
+      "--ticket-title",
+      input.ticketTitle,
+      "--ticket-description",
+      input.ticketDescription,
+      "--repo-url",
+      TEST_REPO_CONFIG.repoUrl.trim(),
+      "--default-branch",
+      TEST_REPO_CONFIG.defaultBranch,
+      "--github-token",
+      githubToken,
+      "--anthropic-api-key",
+      anthropicApiKey,
+      "--triage-model-id",
+      triageModelId,
+      "--simple-model-id",
+      simpleModelId,
+      "--complex-model-id",
+      complexModelId,
+    ],
+  });
 }
 
 async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
@@ -398,6 +574,67 @@ async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
       branchName: result.branchPublished ? result.branchName : null,
       error: null,
     });
+
+    const visualChangesDetected = shouldRunScreenshots(result.changedFiles.files);
+
+    if (result.branchPublished && result.branchName && visualChangesDetected) {
+      await appendEvent(input.runId, {
+        ts: new Date().toISOString(),
+        type: "screenshots.started",
+        message: "Starting visual verification for UI changes",
+      });
+
+      try {
+        const screenshotResult = await runVisualVerification(input, result.branchName);
+
+        if (screenshotResult?.skipped) {
+          await appendEvent(input.runId, {
+            ts: new Date().toISOString(),
+            type: "screenshots.skipped",
+            message: screenshotResult.summary || "Visual verification was skipped",
+          });
+        } else if (screenshotResult?.ok && screenshotResult.screenshots.length > 0) {
+          await writeScreenshotArtifacts(input.ticketId, input.runId, screenshotResult.screenshots);
+          await appendEvent(input.runId, {
+            ts: new Date().toISOString(),
+            type: "screenshots.completed",
+            message: `Captured ${screenshotResult.screenshots.length} screenshots`,
+          });
+          await updateRun(input.runId, {
+            error: null,
+          });
+        } else if (screenshotResult) {
+          const screenshotError = screenshotResult.error?.trim() || "Visual verification failed";
+          await appendEvent(input.runId, {
+            ts: new Date().toISOString(),
+            type: "screenshots.failed",
+            message: screenshotError,
+          });
+          await updateRun(input.runId, {
+            error: screenshotError,
+          });
+        }
+      } catch (error) {
+        const screenshotError = error instanceof Error ? error.message : "Visual verification failed";
+        await appendEvent(input.runId, {
+          ts: new Date().toISOString(),
+          type: "screenshots.failed",
+          message: screenshotError,
+        });
+        await updateRun(input.runId, {
+          error: screenshotError,
+        });
+      }
+    } else {
+      const skipMessage = !result.branchPublished || !result.branchName
+        ? "Visual verification skipped because no review branch was published"
+        : "No UI changes detected for visual verification";
+      await appendEvent(input.runId, {
+        ts: new Date().toISOString(),
+        type: "screenshots.skipped",
+        message: skipMessage,
+      });
+    }
 
     if (result.branchPublished && result.branchName) {
       try {

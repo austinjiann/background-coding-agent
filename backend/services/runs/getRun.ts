@@ -50,6 +50,7 @@ export async function getRun(runId: string): Promise<RunDetails> {
     "diff.patch",
     "modal-output.log",
     "opencode-output.jsonl",
+    "screenshots.json",
     "test-results.json",
     "test-output.txt",
     ...(runEntries.includes("pr.json") ? ["pr.json"] : []),

@@ -1,15 +1,23 @@
 import { readFile, writeFile } from "node:fs/promises";
 
-import { createDraftPr } from "./createDraftPr";
+import { createDraftPr, updateDraftPr } from "./createDraftPr";
 import { appendEvent } from "../runs/appendEvent";
 import { getRun } from "../runs/getRun";
 import { updateRun } from "../runs/updateRun";
 import {
   getChangedFilesPath,
   getPrJsonPath,
+  getScreenshotsMetadataPath,
   getSummaryPath,
   getTestResultsPath,
 } from "../../utils/paths";
+
+type ScreenshotMetadata = {
+  filename?: string;
+  label?: string;
+  kind?: "before" | "after";
+  url?: string;
+};
 
 function formatChangedFilesList(changedFiles: { files?: Array<{ path?: string }> } | null) {
   const files = changedFiles?.files?.map((file) => file.path).filter(Boolean) ?? [];
@@ -47,10 +55,54 @@ function buildPrBody(input: {
     summary?: { passed?: number; failed?: number };
     commands?: Array<{ command?: string; status?: string }>;
   } | null;
+  screenshots: ScreenshotMetadata[] | null;
 }) {
   const ticketLine = input.ticketUrl
     ? `- [${input.ticketId}](${input.ticketUrl})`
     : `- ${input.ticketId}`;
+
+  const screenshotsByLabel = new Map<
+    string,
+    {
+      before?: ScreenshotMetadata;
+      after?: ScreenshotMetadata;
+    }
+  >();
+
+  for (const screenshot of input.screenshots ?? []) {
+    if (!screenshot.label || !screenshot.url) {
+      continue;
+    }
+
+    const entry = screenshotsByLabel.get(screenshot.label) ?? {};
+
+    if (screenshot.kind === "before") {
+      entry.before = screenshot;
+    } else {
+      entry.after = screenshot;
+    }
+
+    screenshotsByLabel.set(screenshot.label, entry);
+  }
+
+  const screenshotSection =
+    screenshotsByLabel.size > 0
+      ? [
+          "",
+          "## Screenshots",
+          ...Array.from(screenshotsByLabel.entries()).flatMap(([label, pair]) => [
+            "",
+            `### ${label}`,
+            pair.before?.url
+              ? `**Before**\n\n![Before ${label}](${pair.before.url})`
+              : "_Before screenshot unavailable_",
+            "",
+            pair.after?.url
+              ? `**After**\n\n![After ${label}](${pair.after.url})`
+              : "_After screenshot unavailable_",
+          ]),
+        ]
+      : [];
 
   return [
     "## Ticket",
@@ -64,6 +116,7 @@ function buildPrBody(input: {
     "",
     "## Test Results",
     formatTestResults(input.testResults),
+    ...screenshotSection,
   ].join("\n");
 }
 
@@ -84,13 +137,17 @@ export async function finalizeDraftPr(input: { ticketId: string; runId: string }
     message: `Creating draft PR for ${run.status.branchName}`,
   });
 
-  const [summaryRaw, changedFilesRaw, testResultsRaw] = await Promise.all([
+  const [summaryRaw, changedFilesRaw, testResultsRaw, screenshotsRaw] = await Promise.all([
     readFile(getSummaryPath(input.ticketId, input.runId), "utf8").catch(() => ""),
     readFile(getChangedFilesPath(input.ticketId, input.runId), "utf8").catch(() => ""),
     readFile(getTestResultsPath(input.ticketId, input.runId), "utf8").catch(() => ""),
+    readFile(getScreenshotsMetadataPath(input.ticketId, input.runId), "utf8").catch(() => ""),
   ]);
 
   const prTitle = run.ticket ? `${run.ticket.identifier}: ${run.ticket.title}` : `${input.ticketId}: Draft PR`;
+  const screenshots = screenshotsRaw.trim()
+    ? ((JSON.parse(screenshotsRaw) as { screenshots?: ScreenshotMetadata[] }).screenshots ?? null)
+    : null;
   const prBody = buildPrBody({
     ticketId: input.ticketId,
     ticketUrl: run.ticket?.url ?? null,
@@ -102,6 +159,7 @@ export async function finalizeDraftPr(input: { ticketId: string; runId: string }
           commands?: Array<{ command?: string; status?: string }>;
         })
       : null,
+    screenshots,
   });
 
   let pr;
@@ -111,6 +169,14 @@ export async function finalizeDraftPr(input: { ticketId: string; runId: string }
       title: prTitle,
       body: prBody,
     });
+
+    if (pr.status === "existing") {
+      await updateDraftPr({
+        prNumber: pr.prNumber,
+        title: prTitle,
+        body: prBody,
+      });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Draft PR creation failed";
     await appendEvent(input.runId, {

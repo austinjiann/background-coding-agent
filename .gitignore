@@ -6,3 +6,4 @@ runs/*
 backend/runs/
 __pycache__/
 *.pyc
+*.tsbuildinfo

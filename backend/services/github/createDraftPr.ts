@@ -19,7 +19,7 @@ type GitHubPull = {
   html_url: string;
 };
 
-function parseGitHubRepo(repoUrl: string) {
+export function parseGitHubRepo(repoUrl: string) {
   const trimmedUrl = repoUrl.trim().replace(/\.git$/, "");
   const match = trimmedUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/);
 
@@ -33,7 +33,7 @@ function parseGitHubRepo(repoUrl: string) {
   };
 }
 
-async function githubRequest(path: string, init: RequestInit = {}) {
+export async function githubRequest(path: string, init: RequestInit = {}) {
   const githubToken = process.env.GITHUB_TOKEN?.trim() ?? "";
 
   if (!githubToken) {
@@ -67,6 +67,29 @@ async function findExistingPullRequest(owner: string, repo: string, branchName: 
 
   const pulls = (await response.json()) as GitHubPull[];
   return pulls[0] ?? null;
+}
+
+export async function updateDraftPr(input: { prNumber: number; title: string; body: string }) {
+  const { owner, repo } = parseGitHubRepo(TEST_REPO_CONFIG.repoUrl);
+  const response = await githubRequest(`/repos/${owner}/${repo}/pulls/${input.prNumber}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      title: input.title,
+      body: input.body,
+    }),
+  });
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(`GitHub PR update failed: ${response.status} ${message}`);
+  }
+
+  const pull = (await response.json()) as GitHubPull;
+  return {
+    prNumber: pull.number,
+    prUrl: pull.html_url,
+    prTitle: pull.title,
+  };
 }
 
 export async function createDraftPr(input: CreateDraftPrInput): Promise<DraftPrResult> {

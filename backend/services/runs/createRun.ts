@@ -9,6 +9,7 @@ import {
   getOpenCodeOutputPath,
   getRunPath,
   getScreenshotsPath,
+  getScreenshotsMetadataPath,
   getStatusPath,
   getSummaryPath,
   getTestOutputPath,
@@ -70,6 +71,7 @@ export async function createRun(ticketId: string): Promise<RunStatus> {
     writeFile(getDiffPatchPath(ticketId, runId), ""),
     writeFile(getModalOutputPath(ticketId, runId), ""),
     writeFile(getOpenCodeOutputPath(ticketId, runId), ""),
+    writeFile(getScreenshotsMetadataPath(ticketId, runId), JSON.stringify({ screenshots: [] }, null, 2)),
     writeFile(getTestResultsPath(ticketId, runId), JSON.stringify({ commands: [] }, null, 2)),
     writeFile(getTestOutputPath(ticketId, runId), ""),
   ]);
