@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { TEST_REPO_CONFIG } from "../../../config/repo";
+import { finalizeDraftPr } from "../github/finalizeDraftPr";
 import { appendEvent } from "../runs/appendEvent";
 import { getRun } from "../runs/getRun";
 import { updateRun } from "../runs/updateRun";
@@ -397,6 +398,18 @@ async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
       branchName: result.branchPublished ? result.branchName : null,
       error: null,
     });
+
+    if (result.branchPublished && result.branchName) {
+      try {
+        await finalizeDraftPr({
+          ticketId: input.ticketId,
+          runId: input.runId,
+        });
+      } catch {
+        // The finalizeDraftPr helper already recorded pr.failed and updated status.error.
+      }
+    }
+
     return;
   }
 
