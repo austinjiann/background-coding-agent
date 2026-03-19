@@ -55,6 +55,14 @@ export function getOpenCodeOutputPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), "opencode-output.jsonl");
 }
 
+export function getModalOutputPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "modal-output.log");
+}
+
+export function getPrJsonPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "pr.json");
+}
+
 export function getScreenshotsPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), "screenshots");
 }

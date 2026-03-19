@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useRef } from "react";
 
 import { useAgentAssignments } from "./AgentAssignmentsProvider";
 import {
@@ -14,22 +15,62 @@ import {
   TicketCard,
 } from "./dashboard-ui";
 import { useTicketsQuery } from "./useFrontendData";
-import { launchRun } from "../lib/api";
-import { AGENT_SLOTS, type DashboardStats, type RunListItem } from "../lib/types";
+import { getRun, launchRun } from "../lib/api";
+import { AGENT_SLOTS, type DashboardStats, type RunListItem, type RunStatusValue } from "../lib/types";
 
 export function DashboardPageClient() {
   const { assignments, assignTicket } = useAgentAssignments();
   const { data: tickets, isLoading, error, setData } = useTicketsQuery();
   const stats = getDashboardStats(tickets, assignments);
-  const visibleTickets = tickets.slice(0, 4);
+  const visibleTickets = tickets.slice(0, 1);
   const visibleRuns = getRunItems(tickets).slice(0, 4);
+
+  // Poll run status for tickets with an active run that isn't terminal
+  const setDataRef = useRef(setData);
+  setDataRef.current = setData;
+
+  useEffect(() => {
+    const TERMINAL: Set<string> = new Set(["completed", "failed", "canceled"]);
+    const POLL_MS = 5_000;
+
+    const interval = setInterval(async () => {
+      const ticketsWithRuns = tickets.filter(
+        (t) => t.activeRunId && !TERMINAL.has(t.runStatus ?? ""),
+      );
+
+      if (ticketsWithRuns.length === 0) return;
+
+      const updates = await Promise.allSettled(
+        ticketsWithRuns.map(async (t) => {
+          const run = await getRun(t.activeRunId!);
+          return { ticketId: t.id, status: run.status.status as RunStatusValue };
+        }),
+      );
+
+      setDataRef.current((current) =>
+        current.map((ticket) => {
+          const result = updates.find(
+            (u, i) => u.status === "fulfilled" && ticketsWithRuns[i].id === ticket.id,
+          );
+          if (result && result.status === "fulfilled") {
+            return { ...ticket, runStatus: result.value.status };
+          }
+          return ticket;
+        }),
+      );
+    }, POLL_MS);
+
+    return () => clearInterval(interval);
+  }, [tickets]);
 
   async function handleLaunch(ticketId: string) {
     const run = await launchRun(ticketId);
 
     setData((current) =>
       current.map((ticket) =>
-        ticket.id === ticketId ? { ...ticket, activeRunId: run.runId } : ticket,
+        ticket.id === ticketId
+          ? { ...ticket, activeRunId: run.runId, runStatus: "running" as RunStatusValue }
+          : ticket,
       ),
     );
   }

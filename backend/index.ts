@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 
+import { registerGitHubRoutes } from "./routes/github";
 import { registerLinearRoutes } from "./routes/linear";
 import { registerRunRoutes } from "./routes/runs";
 
@@ -23,6 +24,7 @@ app.get("/health", (c) => {
 
 registerLinearRoutes(app);
 registerRunRoutes(app);
+registerGitHubRoutes(app);
 
 app.notFound((c) => {
   return c.json({ error: "Not found" }, 404);

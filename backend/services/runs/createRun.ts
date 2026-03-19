@@ -5,6 +5,7 @@ import {
   getChangedFilesPath,
   getDiffPatchPath,
   getEventsPath,
+  getModalOutputPath,
   getOpenCodeOutputPath,
   getRunPath,
   getScreenshotsPath,
@@ -26,6 +27,8 @@ export type RunStatus = {
   completedAt: string | null;
   triageLabel: "simple" | "complex" | null;
   selectedModel: string | null;
+  branchName: string | null;
+  prUrl: string | null;
   error: string | null;
 };
 
@@ -53,6 +56,8 @@ export async function createRun(ticketId: string): Promise<RunStatus> {
     completedAt: null,
     triageLabel: null,
     selectedModel: null,
+    branchName: null,
+    prUrl: null,
     error: null,
   };
 
@@ -63,6 +68,7 @@ export async function createRun(ticketId: string): Promise<RunStatus> {
     writeFile(getSummaryPath(ticketId, runId), ""),
     writeFile(getChangedFilesPath(ticketId, runId), JSON.stringify({ files: [] }, null, 2)),
     writeFile(getDiffPatchPath(ticketId, runId), ""),
+    writeFile(getModalOutputPath(ticketId, runId), ""),
     writeFile(getOpenCodeOutputPath(ticketId, runId), ""),
     writeFile(getTestResultsPath(ticketId, runId), JSON.stringify({ commands: [] }, null, 2)),
     writeFile(getTestOutputPath(ticketId, runId), ""),

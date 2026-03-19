@@ -23,9 +23,8 @@ import type {
   AgentId,
   AgentSlot,
   DashboardStats,
-  RunEvent,
+  RunDetails,
   RunListItem,
-  RunStatus,
   TicketSummary,
 } from "../lib/types";
 
@@ -172,6 +171,12 @@ export function StatusBadge({ status }: { status: string }) {
       <PlayIcon />
     ) : normalized === "queued" ? (
       <ClockIcon />
+    ) : normalized === "idle" || normalized === "canceled" ? (
+      <ClockIcon />
+    ) : normalized.endsWith("assigned") ? (
+      <PersonIcon />
+    ) : normalized === "created" ? (
+      <ClockIcon />
     ) : (
       <ExclamationTriangleIcon />
     );
@@ -184,6 +189,32 @@ export function StatusBadge({ status }: { status: string }) {
   );
 }
 
+function getAgentState(tickets: TicketSummary[]): {
+  dotClass: string;
+  statusText: string;
+} {
+  if (tickets.length === 0) {
+    return { dotClass: "agent-dot is-idle", statusText: "idle" };
+  }
+
+  const statuses = tickets.map((t) => t.runStatus).filter(Boolean);
+
+  if (statuses.includes("running") || statuses.includes("created")) {
+    return { dotClass: "agent-dot is-running", statusText: "running" };
+  }
+  if (statuses.includes("completed")) {
+    return { dotClass: "agent-dot is-completed", statusText: "completed" };
+  }
+  if (statuses.includes("failed")) {
+    return { dotClass: "agent-dot is-failed", statusText: "failed" };
+  }
+  if (statuses.includes("canceled")) {
+    return { dotClass: "agent-dot is-idle", statusText: "canceled" };
+  }
+
+  return { dotClass: "agent-dot", statusText: `${tickets.length} assigned` };
+}
+
 export function AgentCardCompact({
   agent,
   tickets,
@@ -192,14 +223,14 @@ export function AgentCardCompact({
   tickets: TicketSummary[];
 }) {
   const isIdle = tickets.length === 0;
+  const { dotClass, statusText } = getAgentState(tickets);
 
   return (
     <article className="bento-cell bento-agent">
       <div className="bento-agent-header">
-        <div className={`agent-dot${isIdle ? " is-idle" : ""}`} />
-        <StatusBadge status={isIdle ? "idle" : `${tickets.length} assigned`} />
+        <div className={dotClass} />
+        <StatusBadge status={statusText} />
       </div>
-      <p className="eyebrow">{agent.label}</p>
       <h3 className="bento-agent-name">{agent.name}</h3>
       {isIdle ? (
         <p className="helper-copy">Open for a ticket.</p>
@@ -234,7 +265,7 @@ export function TicketCard({
       <div className="ticket-layout">
         <div className="grid gap-3 min-w-0">
           <div>
-            <div className="flex flex-wrap gap-2.5">
+            <div className="flex flex-wrap items-center gap-2.5">
               <span className="font-mono eyebrow">{ticket.identifier}</span>
               <StatusBadge status={ticket.state} />
             </div>
@@ -343,12 +374,13 @@ export function AgentCard({
   tickets: TicketSummary[];
 }) {
   const isIdle = tickets.length === 0;
+  const { dotClass, statusText } = getAgentState(tickets);
 
   return (
     <article className="agent-card">
       <div className="agent-card-header">
         <div className="grid gap-3 min-w-0">
-          <div className={`agent-dot${isIdle ? " is-idle" : ""}`} />
+          <div className={dotClass} />
           <div>
             <p className="eyebrow" style={{ marginBottom: 6 }}>
               {agent.label}
@@ -357,7 +389,7 @@ export function AgentCard({
             <p className="helper-copy">{agent.description}</p>
           </div>
         </div>
-        <StatusBadge status={isIdle ? "idle" : `${tickets.length} assigned`} />
+        <StatusBadge status={statusText} />
       </div>
       {isIdle ? (
         <EmptyState
@@ -480,18 +512,10 @@ export function TicketsTable({
 
 export function RunDetailTabs({
   run,
-  events,
 }: {
-  run: RunStatus;
-  events: RunEvent[];
+  run: RunDetails;
 }) {
-  const artifacts = [
-    "summary.md",
-    "changed-files.json",
-    "test-results.json",
-    "test-output.txt",
-    "screenshots/",
-  ];
+  const currentStage = run.events.at(-1)?.type ?? run.status.status;
 
   return (
     <Tabs.Root className="grid gap-4" defaultValue="timeline">
@@ -512,14 +536,14 @@ export function RunDetailTabs({
             title="Run timeline"
             subtitle="Events streamed from the active run folder."
           />
-          {events.length === 0 ? (
+          {run.events.length === 0 ? (
             <EmptyState
               title="No events yet"
               copy="The run detail route is ready, but this run has not exposed event data yet."
             />
           ) : (
             <div className="grid gap-3">
-              {events.map((event) => (
+              {run.events.map((event) => (
                 <article key={`${event.ts}-${event.type}`} className="timeline-row">
                   <div className="flex flex-wrap gap-2.5">
                     <span className="font-mono">{formatRelativeTimestamp(event.ts)}</span>
@@ -538,19 +562,19 @@ export function RunDetailTabs({
           <div className="grid gap-3">
             <div className="activity-row">
               <strong>Current stage</strong>
-              <p className="helper-copy">{run.stage}</p>
+              <p className="helper-copy">{currentStage}</p>
             </div>
             <div className="activity-row">
               <strong>Sandbox</strong>
-              <p className="helper-copy">{run.sandboxId ?? "Not attached yet"}</p>
+              <p className="helper-copy">{run.status.sandboxId ?? "Not attached yet"}</p>
             </div>
             <div className="activity-row">
               <strong>Branch</strong>
-              <p className="helper-copy">{run.branchName ?? "No branch recorded yet"}</p>
+              <p className="helper-copy">{run.status.branchName ?? "No branch recorded yet"}</p>
             </div>
             <div className="activity-row">
               <strong>Draft PR</strong>
-              <p className="helper-copy">{run.prUrl ?? "No PR URL recorded yet"}</p>
+              <p className="helper-copy">{run.status.prUrl ?? "No PR URL recorded yet"}</p>
             </div>
           </div>
         </section>
@@ -559,7 +583,7 @@ export function RunDetailTabs({
         <section className="panel">
           <SectionHeading title="Artifacts" subtitle="Flat outputs expected in the local run folder." />
           <ul className="grid gap-2.5 p-0 m-0 list-none">
-            {artifacts.map((artifact) => (
+            {run.artifacts.map((artifact) => (
               <li key={artifact}>
                 <span>{artifact}</span>
                 <span className="artifact-copy">Awaiting API endpoint</span>
@@ -574,11 +598,13 @@ export function RunDetailTabs({
 
 export function RunControls({
   busy,
+  canCreatePr,
   onRetry,
   onCancel,
   onCreatePr,
 }: {
   busy: boolean;
+  canCreatePr: boolean;
   onRetry: () => void;
   onCancel: () => void;
   onCreatePr: () => void;
@@ -593,7 +619,7 @@ export function RunControls({
         <CrossCircledIcon />
         Cancel
       </button>
-      <button type="button" className="button" onClick={onCreatePr} disabled={busy}>
+      <button type="button" className="button" onClick={onCreatePr} disabled={busy || !canCreatePr}>
         <ExternalLinkIcon />
         Create Draft PR
       </button>

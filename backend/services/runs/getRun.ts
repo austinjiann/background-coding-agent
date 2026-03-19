@@ -27,11 +27,12 @@ export async function getRun(runId: string): Promise<RunDetails> {
     throw new Error(`Run ${runId} not found`);
   }
 
-  const [statusRaw, ticketRaw, eventsRaw, screenshotNames] = await Promise.all([
+  const [statusRaw, ticketRaw, eventsRaw, screenshotNames, runEntries] = await Promise.all([
     readFile(getStatusPath(location.ticketId, runId), "utf8"),
     readFile(getTicketSnapshotPath(location.ticketId, runId), "utf8").catch(() => ""),
     readFile(getEventsPath(location.ticketId, runId), "utf8").catch(() => ""),
     readdir(getScreenshotsPath(location.ticketId, runId)).catch(() => []),
+    readdir(location.runPath).catch(() => []),
   ]);
 
   const status = JSON.parse(statusRaw) as RunStatus;
@@ -47,9 +48,11 @@ export async function getRun(runId: string): Promise<RunDetails> {
     "summary.md",
     "changed-files.json",
     "diff.patch",
+    "modal-output.log",
     "opencode-output.jsonl",
     "test-results.json",
     "test-output.txt",
+    ...(runEntries.includes("pr.json") ? ["pr.json"] : []),
     ...screenshotNames.map((name) => path.join("screenshots", name)),
   ];
 

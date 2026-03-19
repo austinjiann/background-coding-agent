@@ -20,12 +20,17 @@ opencode_image = (
         "apt-get install -y nodejs",
         "npm install -g opencode-ai",
     )
-    .pip_install("anthropic")
+    .pip_install("anthropic", "playwright")
+    .run_commands("playwright install --with-deps chromium")
 )
 
 WORKSPACE_ROOT = Path("/workspace")
 REPO_PATH = WORKSPACE_ROOT / "repo"
 ARTIFACT_DIR_NAME = ".phoebe_artifacts"
+
+
+def _log_step(step: str) -> None:
+    print(f"PHOEBE_STEP:{step}", flush=True)
 
 
 def _format_command(command: list[str]) -> str:
@@ -229,6 +234,7 @@ def classify_task(
 ) -> str:
     import anthropic
 
+    _log_step("triage.started")
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     prompt = f"""
 Classify this software task as either simple or complex.
@@ -256,7 +262,10 @@ Ticket description:
         for block in response.content
         if getattr(block, "type", None) == "text"
     ).lower()
-    return "complex" if "complex" in text else "simple"
+    classification = "complex" if "complex" in text else "simple"
+    print(f"Phoebe triage selected: {classification}", flush=True)
+    _log_step("triage.completed")
+    return classification
 
 
 def _build_task_prompt(ticket_id: str, ticket_title: str, ticket_description: str) -> str:
@@ -281,6 +290,10 @@ You are working on ticket {ticket_id}: {ticket_title}
 """.strip()
 
 
+def _build_branch_name(ticket_id: str) -> str:
+    return f"phoebe/{ticket_id}"
+
+
 def run_opencode_job(
     *,
     ticket_id: str,
@@ -302,6 +315,7 @@ def run_opencode_job(
     commands: list[dict[str, object]] = []
     output_chunks: list[str] = []
 
+    _log_step("repo.clone.started")
     clone_command = [
         "git",
         "clone",
@@ -332,6 +346,7 @@ def run_opencode_job(
             "opencodeOutput": "",
             "error": "git clone failed",
         }
+    _log_step("repo.clone.completed")
 
     triage_label = classify_task(
         ticket_title=ticket_title,
@@ -361,11 +376,14 @@ def run_opencode_job(
         "--dir",
         str(REPO_PATH),
     ]
+    print(f"Phoebe OpenCode model: {selected_model}", flush=True)
+    _log_step("opencode.started")
     opencode_result, opencode_log_output, opencode_stdout, opencode_stderr = _run_command(
         opencode_command,
         env=opencode_env,
         timeout=600,
     )
+    _log_step("opencode.completed")
     commands.append(opencode_result)
     output_chunks.append(opencode_log_output)
 
@@ -406,11 +424,52 @@ def run_opencode_job(
         cwd=REPO_PATH,
     )
     commands.extend([status_result, diff_numstat_result, diff_result])
-    output_chunks.extend([status_log_output, diff_numstat_log_output, diff_log_output])
+    output_chunks.extend(
+        [
+            status_log_output,
+            diff_numstat_log_output,
+            diff_log_output,
+        ]
+    )
 
     changed_files = _parse_changed_files(status_stdout, diff_numstat_stdout)
+    branch_name = _build_branch_name(ticket_id) if changed_files else None
+    branch_published = False
+    branch_error = None
+
+    if branch_name:
+        _log_step("branch.publishing")
+        print(f"Phoebe publishing branch via git push: {branch_name}", flush=True)
+        tokenized_origin = _build_clone_url(repo_url, github_token)
+        git_commands = [
+            ["git", "config", "--global", "user.email", "phoebe@bot"],
+            ["git", "config", "--global", "user.name", "Phoebe"],
+            ["git", "remote", "set-url", "origin", tokenized_origin],
+            ["git", "checkout", "-B", branch_name],
+            ["git", "add", "-A"],
+            ["git", "commit", "-m", f"phoebe: {ticket_id} - {ticket_title}"],
+            ["git", "push", "--force", "-u", "origin", f"HEAD:refs/heads/{branch_name}"],
+        ]
+        git_results: list[dict[str, object]] = []
+        for command in git_commands:
+            result, log_output, _, stderr_text = _run_command(command, cwd=REPO_PATH)
+            git_results.append(result)
+            commands.append(result)
+            output_chunks.append(log_output)
+            if result["status"] != "passed":
+                branch_error = stderr_text or log_output or f"Failed to publish branch {branch_name}"
+                print(f"Phoebe branch publication failed: {branch_error}", flush=True)
+                break
+
+        branch_published = all(result["status"] == "passed" for result in git_results)
+        if branch_published:
+            _log_step("branch.published")
+
     failed_commands = sum(1 for command in commands if command["status"] == "failed")
     ok = opencode_result["status"] == "passed" and failed_commands == 0
+    error = None if ok else "OpenCode reported failures or produced failing commands"
+    if branch_name and not branch_published:
+        error = branch_error or f"Failed to publish branch {branch_name}"
 
     return {
         "ok": ok,
@@ -419,12 +478,14 @@ def run_opencode_job(
         or f"OpenCode finished for {ticket_id} using {selected_model}. See raw output for details.",
         "triageLabel": triage_label,
         "selectedModel": selected_model,
+        "branchName": branch_name,
+        "branchPublished": branch_published,
         "changedFiles": {"files": changed_files},
         "diffText": diff_stdout,
         "testResults": test_results,
         "testOutput": "\n\n".join(chunk for chunk in output_chunks if chunk),
         "opencodeOutput": opencode_stdout or opencode_stderr,
-        "error": None if ok else "OpenCode reported failures or produced failing commands",
+        "error": error,
     }
 
 

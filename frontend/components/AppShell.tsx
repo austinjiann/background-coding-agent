@@ -86,14 +86,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </ScrollArea.Root>
       </aside>
       <main className="main-panel">
-        <ScrollArea.Root className="main-scroll" type="auto">
-          <ScrollArea.Viewport className="main-content">{children}</ScrollArea.Viewport>
-          <ScrollArea.Scrollbar orientation="vertical" style={{ width: 10 }}>
-            <ScrollArea.Thumb
-              style={{ flex: 1, borderRadius: 999, background: "rgba(65, 57, 49, 0.16)" }}
-            />
-          </ScrollArea.Scrollbar>
-        </ScrollArea.Root>
+        <div className="main-content">{children}</div>
       </main>
     </div>
   );

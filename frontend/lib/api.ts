@@ -1,4 +1,4 @@
-import type { RunEvent, RunStatus, TicketSummary } from "./types";
+import type { BackendRunStatus, RunDetails, RunEvent, TicketSummary } from "./types";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
 
@@ -25,7 +25,7 @@ export async function launchRun(ticketId: string) {
 }
 
 export async function getRun(runId: string) {
-  return requestJson<RunStatus>(`/runs/${runId}`);
+  return requestJson<RunDetails>(`/runs/${runId}`);
 }
 
 export async function getRunEvents(ticketId: string, runId: string) {
@@ -40,7 +40,7 @@ export async function retryRun(runId: string) {
 }
 
 export async function cancelRun(ticketId: string, runId: string) {
-  return requestJson<RunStatus>(`/runs/${runId}/cancel`, {
+  return requestJson<BackendRunStatus>(`/runs/${runId}/cancel`, {
     method: "POST",
   });
 }

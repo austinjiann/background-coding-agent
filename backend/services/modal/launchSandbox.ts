@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +10,7 @@ import { updateRun } from "../runs/updateRun";
 import {
   getChangedFilesPath,
   getDiffPatchPath,
+  getModalOutputPath,
   getOpenCodeOutputPath,
   getRunPath,
   getSummaryPath,
@@ -47,6 +48,8 @@ type ModalAgentResult = {
   summary: string;
   triageLabel: "simple" | "complex";
   selectedModel: string;
+  branchName: string | null;
+  branchPublished: boolean;
   changedFiles: {
     files: ChangedFile[];
   };
@@ -72,6 +75,42 @@ const activeModalProcesses = new Map<string, ChildProcessWithoutNullStreams>();
 const repoRoot = path.resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 const modalEntrypointPath = path.join(repoRoot, "modal", "sandbox.py");
 const modalSourcePath = path.join(repoRoot, "modal");
+const LOG_MARKER_PREFIX = "PHOEBE_STEP:";
+
+const LOG_MARKER_EVENTS: Record<string, { type: string; message: string }> = {
+  "repo.clone.started": {
+    type: "repo.cloning",
+    message: "Cloning repository in Modal sandbox",
+  },
+  "repo.clone.completed": {
+    type: "repo.cloned",
+    message: "Repository clone completed",
+  },
+  "triage.started": {
+    type: "triage.started",
+    message: "Selecting model for the ticket",
+  },
+  "triage.completed": {
+    type: "triage.completed",
+    message: "Model selection completed",
+  },
+  "opencode.started": {
+    type: "opencode.started",
+    message: "OpenCode execution started",
+  },
+  "opencode.completed": {
+    type: "opencode.completed",
+    message: "OpenCode execution finished",
+  },
+  "branch.publishing": {
+    type: "branch.publishing",
+    message: "Publishing branch to GitHub",
+  },
+  "branch.published": {
+    type: "branch.published",
+    message: "Branch publication completed",
+  },
+};
 
 async function isCanceled(runId: string) {
   const run = await getRun(runId);
@@ -135,6 +174,45 @@ async function writeSuccessArtifacts(ticketId: string, runId: string, result: Mo
   ]);
 }
 
+async function appendModalLogChunk(ticketId: string, runId: string, chunk: string) {
+  if (!chunk) {
+    return;
+  }
+
+  await appendFile(getModalOutputPath(ticketId, runId), chunk, "utf8");
+}
+
+async function appendEventsForMarkers(runId: string, chunk: string, seenMarkers: Set<string>) {
+  const lines = chunk.split("\n");
+
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+
+    if (!trimmedLine.startsWith(LOG_MARKER_PREFIX)) {
+      continue;
+    }
+
+    const marker = trimmedLine.slice(LOG_MARKER_PREFIX.length).trim();
+
+    if (!marker || seenMarkers.has(marker)) {
+      continue;
+    }
+
+    seenMarkers.add(marker);
+    const eventInfo = LOG_MARKER_EVENTS[marker];
+
+    if (!eventInfo) {
+      continue;
+    }
+
+    await appendEvent(runId, {
+      ts: new Date().toISOString(),
+      type: eventInfo.type,
+      message: eventInfo.message,
+    });
+  }
+}
+
 async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutput> {
   const repoUrl = TEST_REPO_CONFIG.repoUrl.trim();
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
@@ -155,7 +233,6 @@ async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutpu
   const complexModelId = process.env.COMPLEX_MODEL_ID ?? DEFAULT_COMPLEX_MODEL_ID;
   const modalArgs = [
     "run",
-    "--quiet",
     "--write-result",
     resultPath,
     `${modalEntrypointPath}::run_opencode`,
@@ -192,12 +269,18 @@ async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutpu
   activeModalProcesses.set(input.runId, child);
 
   let cliOutput = "";
-  child.stdout.on("data", (chunk) => {
-    cliOutput += chunk.toString();
-  });
-  child.stderr.on("data", (chunk) => {
-    cliOutput += chunk.toString();
-  });
+  let writeQueue = Promise.resolve();
+  const seenMarkers = new Set<string>();
+  const handleChunk = (rawChunk: Buffer) => {
+    const chunk = rawChunk.toString();
+    cliOutput += chunk;
+    writeQueue = writeQueue
+      .then(() => appendModalLogChunk(input.ticketId, input.runId, chunk))
+      .then(() => appendEventsForMarkers(input.runId, chunk, seenMarkers))
+      .catch(() => undefined);
+  };
+  child.stdout.on("data", handleChunk);
+  child.stderr.on("data", handleChunk);
 
   const exitState = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolve, reject) => {
@@ -207,6 +290,8 @@ async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutpu
       });
     },
   );
+
+  await writeQueue;
 
   activeModalProcesses.delete(input.runId);
 
@@ -283,6 +368,20 @@ async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
 
   await writeSuccessArtifacts(input.ticketId, input.runId, result);
 
+  if (result.branchPublished && result.branchName) {
+    await appendEvent(input.runId, {
+      ts: new Date().toISOString(),
+      type: "branch.published",
+      message: `Published branch ${result.branchName}`,
+    });
+  } else if (result.branchName) {
+    await appendEvent(input.runId, {
+      ts: new Date().toISOString(),
+      type: "branch.publish_failed",
+      message: `Failed to publish branch ${result.branchName}`,
+    });
+  }
+
   if (result.ok) {
     await appendEvent(input.runId, {
       ts: new Date().toISOString(),
@@ -295,6 +394,7 @@ async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
       sandboxId: result.sandboxId,
       triageLabel: result.triageLabel,
       selectedModel: result.selectedModel,
+      branchName: result.branchPublished ? result.branchName : null,
       error: null,
     });
     return;
@@ -311,6 +411,7 @@ async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
     sandboxId: result.sandboxId,
     triageLabel: result.triageLabel,
     selectedModel: result.selectedModel,
+    branchName: result.branchPublished ? result.branchName : null,
     error: failureMessage,
   });
 }
