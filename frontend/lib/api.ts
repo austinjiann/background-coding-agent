@@ -13,11 +13,11 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export async function getLinearTickets() {
-  return requestJson<TicketSummary[]>("/linear/tickets");
+  return requestJson<TicketSummary[]>("/linear/issues");
 }
 
 export async function launchRun(ticketId: string) {
-  return requestJson<RunStatus>("/runs/launch", {
+  return requestJson<{ runId: string }>("/runs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ticketId }),
@@ -33,19 +33,15 @@ export async function getRunEvents(ticketId: string, runId: string) {
   return requestJson<RunEvent[]>(`/runs/${runId}/events?${search.toString()}`);
 }
 
-export async function retryRun(ticketId: string) {
-  return requestJson<RunStatus>("/runs/retry", {
+export async function retryRun(runId: string) {
+  return requestJson<{ runId: string }>(`/runs/${runId}/retry`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ticketId }),
   });
 }
 
 export async function cancelRun(ticketId: string, runId: string) {
-  return requestJson<{ ticketId: string; runId: string; status: string }>("/runs/cancel", {
+  return requestJson<RunStatus>(`/runs/${runId}/cancel`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ticketId, runId }),
   });
 }
 

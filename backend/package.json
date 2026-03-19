@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --env-file ../.env --watch index.ts",
-    "start": "bun --env-file ../.env index.ts"
+    "dev": "env -i HOME=$HOME PATH=$PATH bun --env-file ../.env --watch index.ts",
+    "start": "env -i HOME=$HOME PATH=$PATH bun --env-file ../.env index.ts"
   }
 }

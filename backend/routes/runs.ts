@@ -1,10 +1,14 @@
+import { writeFile } from "node:fs/promises";
+
 import type { Hono } from "hono";
 
+import { fetchLinearIssueByTicketId } from "../services/linear/client";
 import { cancelSandboxRun, launchSandbox } from "../services/modal/launchSandbox";
 import { appendEvent } from "../services/runs/appendEvent";
 import { createRun } from "../services/runs/createRun";
 import { getRun } from "../services/runs/getRun";
 import { updateRun } from "../services/runs/updateRun";
+import { getTicketSnapshotPath } from "../utils/paths";
 
 type CreateRunBody = {
   ticketId?: unknown;
@@ -12,25 +16,40 @@ type CreateRunBody = {
 
 export function registerRunRoutes(app: Hono) {
   app.post("/runs", async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as CreateRunBody;
-    const ticketId = typeof body.ticketId === "string" ? body.ticketId.trim() : "";
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as CreateRunBody;
+      const ticketId = typeof body.ticketId === "string" ? body.ticketId.trim() : "";
 
-    if (!ticketId) {
-      return c.json({ error: "ticketId is required" }, 400);
+      if (!ticketId) {
+        return c.json({ error: "ticketId is required" }, 400);
+      }
+
+      const issue = await fetchLinearIssueByTicketId(ticketId);
+      const run = await createRun(issue.identifier);
+      await writeFile(
+        getTicketSnapshotPath(issue.identifier, run.runId),
+        JSON.stringify(issue, null, 2),
+        "utf8",
+      );
+      await appendEvent(run.runId, {
+        ts: new Date().toISOString(),
+        type: "run.started",
+        message: "Run created",
+      });
+      void launchSandbox({
+        ticketId: issue.identifier,
+        runId: run.runId,
+        ticketTitle: issue.title,
+        ticketDescription: issue.description,
+      });
+
+      return c.json({ runId: run.runId }, 201);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("not found")) {
+        return c.json({ error: error.message }, 404);
+      }
+      throw error;
     }
-
-    const run = await createRun(ticketId);
-    await appendEvent(run.runId, {
-      ts: new Date().toISOString(),
-      type: "run.started",
-      message: "Run created",
-    });
-    void launchSandbox({
-      ticketId,
-      runId: run.runId,
-    });
-
-    return c.json({ runId: run.runId }, 201);
   });
 
   app.get("/runs/:runId", async (c) => {
@@ -52,7 +71,20 @@ export function registerRunRoutes(app: Hono) {
 
     try {
       const existingRun = await getRun(runId);
-      const newRun = await createRun(existingRun.status.ticketId);
+      const issue =
+        (await fetchLinearIssueByTicketId(existingRun.status.ticketId).catch(() => null)) ??
+        existingRun.ticket;
+
+      if (!issue) {
+        return c.json({ error: `Linear issue ${existingRun.status.ticketId} not found` }, 404);
+      }
+
+      const newRun = await createRun(issue.identifier);
+      await writeFile(
+        getTicketSnapshotPath(issue.identifier, newRun.runId),
+        JSON.stringify(issue, null, 2),
+        "utf8",
+      );
 
       await appendEvent(newRun.runId, {
         ts: new Date().toISOString(),
@@ -68,8 +100,10 @@ export function registerRunRoutes(app: Hono) {
       });
 
       void launchSandbox({
-        ticketId: existingRun.status.ticketId,
+        ticketId: issue.identifier,
         runId: newRun.runId,
+        ticketTitle: issue.title,
+        ticketDescription: issue.description,
       });
 
       return c.json({ runId: newRun.runId }, 201);

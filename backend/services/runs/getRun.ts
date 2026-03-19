@@ -6,12 +6,15 @@ import {
   getEventsPath,
   getScreenshotsPath,
   getStatusPath,
+  getTicketSnapshotPath,
 } from "../../utils/paths";
 import type { RunStatus } from "./createRun";
 import type { RunEvent } from "./appendEvent";
+import type { LinearIssue } from "../linear/client";
 
 export type RunDetails = {
   status: RunStatus;
+  ticket: LinearIssue | null;
   events: RunEvent[];
   artifacts: string[];
 };
@@ -24,13 +27,15 @@ export async function getRun(runId: string): Promise<RunDetails> {
     throw new Error(`Run ${runId} not found`);
   }
 
-  const [statusRaw, eventsRaw, screenshotNames] = await Promise.all([
+  const [statusRaw, ticketRaw, eventsRaw, screenshotNames] = await Promise.all([
     readFile(getStatusPath(location.ticketId, runId), "utf8"),
+    readFile(getTicketSnapshotPath(location.ticketId, runId), "utf8").catch(() => ""),
     readFile(getEventsPath(location.ticketId, runId), "utf8").catch(() => ""),
     readdir(getScreenshotsPath(location.ticketId, runId)).catch(() => []),
   ]);
 
   const status = JSON.parse(statusRaw) as RunStatus;
+  const ticket = ticketRaw.trim() ? (JSON.parse(ticketRaw) as LinearIssue) : null;
   const events = eventsRaw
     .split("\n")
     .map((line) => line.trim())
@@ -38,7 +43,11 @@ export async function getRun(runId: string): Promise<RunDetails> {
     .map((line) => JSON.parse(line) as RunEvent);
 
   const artifacts = [
+    "ticket.json",
     "summary.md",
+    "changed-files.json",
+    "diff.patch",
+    "opencode-output.jsonl",
     "test-results.json",
     "test-output.txt",
     ...screenshotNames.map((name) => path.join("screenshots", name)),
@@ -46,6 +55,7 @@ export async function getRun(runId: string): Promise<RunDetails> {
 
   return {
     status,
+    ticket,
     events,
     artifacts,
   };

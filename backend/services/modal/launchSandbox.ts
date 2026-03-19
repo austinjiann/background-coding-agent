@@ -8,40 +8,63 @@ import { appendEvent } from "../runs/appendEvent";
 import { getRun } from "../runs/getRun";
 import { updateRun } from "../runs/updateRun";
 import {
+  getChangedFilesPath,
+  getDiffPatchPath,
+  getOpenCodeOutputPath,
   getRunPath,
   getSummaryPath,
   getTestOutputPath,
   getTestResultsPath,
 } from "../../utils/paths";
 
+const DEFAULT_TRIAGE_MODEL_ID = "claude-haiku-4-5-20251001";
+const DEFAULT_SIMPLE_MODEL_ID = "anthropic/claude-sonnet-4-6";
+const DEFAULT_COMPLEX_MODEL_ID = "anthropic/claude-opus-4-6";
+
 type LaunchSandboxInput = {
   ticketId: string;
   runId: string;
+  ticketTitle: string;
+  ticketDescription: string;
 };
 
-type ModalCommandResult = {
+type ChangedFile = {
+  path: string;
+  status: string;
+  additions?: number;
+  deletions?: number;
+};
+
+type TestCommandResult = {
   command: string;
   status: "passed" | "failed";
-  exitCode: number;
+  exitCode?: number;
 };
 
-type ModalSmokeResult = {
+type ModalAgentResult = {
   ok: boolean;
   sandboxId: string;
   summary: string;
+  triageLabel: "simple" | "complex";
+  selectedModel: string;
+  changedFiles: {
+    files: ChangedFile[];
+  };
+  diffText: string;
   testResults: {
     summary: {
       passed: number;
       failed: number;
     };
-    commands: ModalCommandResult[];
+    commands: TestCommandResult[];
   };
   testOutput: string;
+  opencodeOutput: string;
   error?: string | null;
 };
 
 type ModalRunOutput = {
-  result: ModalSmokeResult | null;
+  result: ModalAgentResult | null;
   cliOutput: string;
 };
 
@@ -70,9 +93,12 @@ async function writeFailureArtifacts(ticketId: string, runId: string, message: s
   await Promise.all([
     writeFile(
       getSummaryPath(ticketId, runId),
-      ["# Run Summary", "", "Modal smoke run failed.", "", message].join("\n"),
+      ["# Run Summary", "", "OpenCode run failed.", "", message].join("\n"),
       "utf8",
     ),
+    writeFile(getChangedFilesPath(ticketId, runId), JSON.stringify({ files: [] }, null, 2), "utf8"),
+    writeFile(getDiffPatchPath(ticketId, runId), "", "utf8"),
+    writeFile(getOpenCodeOutputPath(ticketId, runId), "", "utf8"),
     writeFile(
       getTestResultsPath(ticketId, runId),
       JSON.stringify(
@@ -92,53 +118,69 @@ async function writeFailureArtifacts(ticketId: string, runId: string, message: s
   ]);
 }
 
-async function writeSuccessArtifacts(
-  ticketId: string,
-  runId: string,
-  result: ModalSmokeResult,
-) {
+async function writeSuccessArtifacts(ticketId: string, runId: string, result: ModalAgentResult) {
   await appendEvent(runId, {
     ts: new Date().toISOString(),
     type: "sandbox.completed",
-    message: "Modal smoke run finished",
+    message: "Modal OpenCode run finished",
   });
 
   await Promise.all([
     writeFile(getSummaryPath(ticketId, runId), `# Run Summary\n\n${result.summary}\n`, "utf8"),
+    writeFile(getChangedFilesPath(ticketId, runId), JSON.stringify(result.changedFiles, null, 2), "utf8"),
+    writeFile(getDiffPatchPath(ticketId, runId), result.diffText, "utf8"),
+    writeFile(getOpenCodeOutputPath(ticketId, runId), result.opencodeOutput, "utf8"),
     writeFile(getTestResultsPath(ticketId, runId), JSON.stringify(result.testResults, null, 2), "utf8"),
     writeFile(getTestOutputPath(ticketId, runId), result.testOutput, "utf8"),
   ]);
 }
 
-async function runModalCommand({
-  ticketId,
-  runId,
-}: LaunchSandboxInput): Promise<ModalRunOutput> {
+async function runModalCommand(input: LaunchSandboxInput): Promise<ModalRunOutput> {
   const repoUrl = TEST_REPO_CONFIG.repoUrl.trim();
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
 
   if (!repoUrl) {
     throw new Error("TEST_REPO_URL is not configured");
   }
 
-  const resultPath = getModalResultPath(ticketId, runId);
+  if (!anthropicApiKey) {
+    throw new Error("ANTHROPIC_API_KEY is not configured");
+  }
+
+  const resultPath = getModalResultPath(input.ticketId, input.runId);
   const modalBinary = process.env.MODAL_BIN ?? "modal";
   const githubToken = process.env.GITHUB_TOKEN ?? "";
+  const triageModelId = process.env.TRIAGE_MODEL_ID ?? DEFAULT_TRIAGE_MODEL_ID;
+  const simpleModelId = process.env.SIMPLE_MODEL_ID ?? DEFAULT_SIMPLE_MODEL_ID;
+  const complexModelId = process.env.COMPLEX_MODEL_ID ?? DEFAULT_COMPLEX_MODEL_ID;
   const modalArgs = [
     "run",
     "--quiet",
     "--write-result",
     resultPath,
-    `${modalEntrypointPath}::run_smoke`,
+    `${modalEntrypointPath}::run_opencode`,
     "--ticket-id",
-    ticketId,
+    input.ticketId,
     "--run-id",
-    runId,
+    input.runId,
+    "--ticket-title",
+    input.ticketTitle,
+    "--ticket-description",
+    input.ticketDescription,
     "--repo-url",
     repoUrl,
     "--default-branch",
     TEST_REPO_CONFIG.defaultBranch,
     "--github-token",
     githubToken,
+    "--anthropic-api-key",
+    anthropicApiKey,
+    "--triage-model-id",
+    triageModelId,
+    "--simple-model-id",
+    simpleModelId,
+    "--complex-model-id",
+    complexModelId,
   ];
   const child = spawn(modalBinary, modalArgs, {
     cwd: repoRoot,
@@ -147,7 +189,7 @@ async function runModalCommand({
       PYTHONPATH: buildPythonPath(),
     },
   });
-  activeModalProcesses.set(runId, child);
+  activeModalProcesses.set(input.runId, child);
 
   let cliOutput = "";
   child.stdout.on("data", (chunk) => {
@@ -166,9 +208,9 @@ async function runModalCommand({
     },
   );
 
-  activeModalProcesses.delete(runId);
+  activeModalProcesses.delete(input.runId);
 
-  if (await isCanceled(runId)) {
+  if (await isCanceled(input.runId)) {
     await rm(resultPath, { force: true }).catch(() => undefined);
     return {
       result: null,
@@ -181,7 +223,7 @@ async function runModalCommand({
 
   if (!resultRaw.trim()) {
     const failureMessage = [
-      `Modal run exited before writing a result file.`,
+      "Modal run exited before writing a result file.",
       `exitCode=${String(exitState.code)}`,
       exitState.signal ? `signal=${exitState.signal}` : null,
       cliOutput.trim() ? "" : null,
@@ -193,36 +235,36 @@ async function runModalCommand({
   }
 
   return {
-    result: JSON.parse(resultRaw) as ModalSmokeResult,
+    result: JSON.parse(resultRaw) as ModalAgentResult,
     cliOutput,
   };
 }
 
-async function runModalExecutor({ ticketId, runId }: LaunchSandboxInput): Promise<void> {
-  await appendEvent(runId, {
+async function runModalExecutor(input: LaunchSandboxInput): Promise<void> {
+  await appendEvent(input.runId, {
     ts: new Date().toISOString(),
     type: "sandbox.starting",
-    message: "Launching Modal smoke run",
+    message: "Launching Modal OpenCode run",
   });
-  await updateRun(runId, {
+  await updateRun(input.runId, {
     status: "running",
-    sandboxId: `modal-run:${runId}`,
+    sandboxId: `modal-run:${input.runId}`,
   });
-  await appendEvent(runId, {
+  await appendEvent(input.runId, {
     ts: new Date().toISOString(),
     type: "sandbox.ready",
-    message: "Modal run started",
+    message: "Modal OpenCode run started",
   });
-  await appendEvent(runId, {
+  await appendEvent(input.runId, {
     ts: new Date().toISOString(),
     type: "agent.running",
-    message: "Remote smoke checks are running",
+    message: "Remote OpenCode task is running",
   });
 
-  const { result, cliOutput } = await runModalCommand({ ticketId, runId });
+  const { result, cliOutput } = await runModalCommand(input);
 
-  if (await isCanceled(runId)) {
-    await appendEvent(runId, {
+  if (await isCanceled(input.runId)) {
+    await appendEvent(input.runId, {
       ts: new Date().toISOString(),
       type: "run.stopped",
       message: "Run stopped before Modal results were written locally",
@@ -231,7 +273,7 @@ async function runModalExecutor({ ticketId, runId }: LaunchSandboxInput): Promis
   }
 
   if (!result) {
-    await appendEvent(runId, {
+    await appendEvent(input.runId, {
       ts: new Date().toISOString(),
       type: "run.stopped",
       message: "Run stopped before Modal finished",
@@ -239,32 +281,36 @@ async function runModalExecutor({ ticketId, runId }: LaunchSandboxInput): Promis
     return;
   }
 
-  await writeSuccessArtifacts(ticketId, runId, result);
+  await writeSuccessArtifacts(input.ticketId, input.runId, result);
 
   if (result.ok) {
-    await appendEvent(runId, {
+    await appendEvent(input.runId, {
       ts: new Date().toISOString(),
       type: "tests.passed",
-      message: "Modal smoke checks passed",
+      message: "OpenCode task completed and reported passing tests",
     });
-    await updateRun(runId, {
+    await updateRun(input.runId, {
       status: "completed",
       completedAt: new Date().toISOString(),
       sandboxId: result.sandboxId,
+      triageLabel: result.triageLabel,
+      selectedModel: result.selectedModel,
       error: null,
     });
     return;
   }
 
-  const failureMessage = result.error?.trim() || cliOutput.trim() || "Modal smoke run failed";
-  await appendEvent(runId, {
+  const failureMessage = result.error?.trim() || cliOutput.trim() || "OpenCode run failed";
+  await appendEvent(input.runId, {
     ts: new Date().toISOString(),
     type: "tests.failed",
-    message: "Modal smoke checks failed",
+    message: "OpenCode task completed with failing tests or errors",
   });
-  await updateRun(runId, {
+  await updateRun(input.runId, {
     status: "failed",
     sandboxId: result.sandboxId,
+    triageLabel: result.triageLabel,
+    selectedModel: result.selectedModel,
     error: failureMessage,
   });
 }
@@ -286,10 +332,9 @@ export async function cancelSandboxRun(runId: string): Promise<boolean> {
   return true;
 }
 
-// Keep the public signature aligned with the future OpenCode integration.
 export async function launchSandbox(input: LaunchSandboxInput): Promise<void> {
   void runModalExecutor(input).catch(async (error) => {
-    const message = error instanceof Error ? error.message : "Modal smoke run failed";
+    const message = error instanceof Error ? error.message : "Modal OpenCode run failed";
 
     await writeFailureArtifacts(input.ticketId, input.runId, message).catch(() => undefined);
     await appendEvent(input.runId, {

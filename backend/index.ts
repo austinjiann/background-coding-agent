@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 
 import { registerLinearRoutes } from "./routes/linear";
 import { registerRunRoutes } from "./routes/runs";
@@ -11,6 +12,8 @@ declare const Bun: {
 };
 
 export const app = new Hono();
+
+app.use("*", cors());
 
 app.get("/health", (c) => {
   return c.json({

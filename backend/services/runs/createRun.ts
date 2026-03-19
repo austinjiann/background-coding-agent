@@ -2,13 +2,17 @@ import { mkdir, writeFile } from "node:fs/promises";
 
 import { createRunId } from "../../utils/ids";
 import {
+  getChangedFilesPath,
+  getDiffPatchPath,
   getEventsPath,
+  getOpenCodeOutputPath,
   getRunPath,
   getScreenshotsPath,
   getStatusPath,
   getSummaryPath,
   getTestOutputPath,
   getTestResultsPath,
+  getTicketSnapshotPath,
 } from "../../utils/paths";
 
 export type RunStatus = {
@@ -20,6 +24,8 @@ export type RunStatus = {
   sandboxId: string | null;
   canceledAt: string | null;
   completedAt: string | null;
+  triageLabel: "simple" | "complex" | null;
+  selectedModel: string | null;
   error: string | null;
 };
 
@@ -45,13 +51,19 @@ export async function createRun(ticketId: string): Promise<RunStatus> {
     sandboxId: null,
     canceledAt: null,
     completedAt: null,
+    triageLabel: null,
+    selectedModel: null,
     error: null,
   };
 
   await Promise.all([
     writeFile(getStatusPath(ticketId, runId), JSON.stringify(status, null, 2)),
     writeFile(getEventsPath(ticketId, runId), ""),
+    writeFile(getTicketSnapshotPath(ticketId, runId), ""),
     writeFile(getSummaryPath(ticketId, runId), ""),
+    writeFile(getChangedFilesPath(ticketId, runId), JSON.stringify({ files: [] }, null, 2)),
+    writeFile(getDiffPatchPath(ticketId, runId), ""),
+    writeFile(getOpenCodeOutputPath(ticketId, runId), ""),
     writeFile(getTestResultsPath(ticketId, runId), JSON.stringify({ commands: [] }, null, 2)),
     writeFile(getTestOutputPath(ticketId, runId), ""),
   ]);

@@ -38,7 +38,6 @@ export function DashboardPageClient() {
     <>
       <PageHeader
         title="Monitor Lue Agent"
-        subtitle="Monitor the agents working on linear tickets."
         stats={stats}
       />
 

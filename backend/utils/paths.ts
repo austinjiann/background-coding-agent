@@ -31,12 +31,28 @@ export function getSummaryPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), "summary.md");
 }
 
+export function getTicketSnapshotPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "ticket.json");
+}
+
 export function getTestResultsPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), "test-results.json");
 }
 
 export function getTestOutputPath(ticketId: string, runId: string) {
   return path.join(getRunPath(ticketId, runId), "test-output.txt");
+}
+
+export function getChangedFilesPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "changed-files.json");
+}
+
+export function getDiffPatchPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "diff.patch");
+}
+
+export function getOpenCodeOutputPath(ticketId: string, runId: string) {
+  return path.join(getRunPath(ticketId, runId), "opencode-output.jsonl");
 }
 
 export function getScreenshotsPath(ticketId: string, runId: string) {
